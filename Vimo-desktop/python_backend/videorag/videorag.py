@@ -139,6 +139,9 @@ class VideoRAG:
         assert self.openai_api_key is not None, "openai_api_key is required"
         assert self.openai_base_url is not None, "openai_base_url is required"
 
+        # Update llm config with user-defined caption model
+        self.llm.caption_model_name = self.caption_model
+
         # Create working directory if it doesn't exist
         if not os.path.exists(self.working_dir) and self.always_create_working_dir:
             os.makedirs(self.working_dir)
