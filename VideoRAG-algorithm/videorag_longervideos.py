@@ -6,6 +6,7 @@ import multiprocessing
 import sys
 
 warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 import argparse
@@ -52,6 +53,8 @@ if __name__ == '__main__':
     videorag = VideoRAG(llm=longervideos_llm_config, working_dir=f"./longervideos/videorag-workdir/{sub_category}")    
     videorag.insert_video(video_path_list=video_paths)
     
+    logging.info("--- Video indexing complete. Starting inference stage. ---")
+
     ## inference
     with open(f'./longervideos/dataset.json', 'r') as f:
         longervideos = json.load(f)
