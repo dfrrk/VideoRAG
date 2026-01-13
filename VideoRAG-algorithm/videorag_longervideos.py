@@ -70,7 +70,11 @@ if __name__ == '__main__':
     video_base_path = f'./longervideos/{sub_category}/videos/'
     video_files = sorted(os.listdir(video_base_path))
     video_paths = [os.path.join(video_base_path, f) for f in video_files]
-    videorag = VideoRAG(llm=longervideos_llm_config, working_dir=f"./longervideos/videorag-workdir/{sub_category}")    
+    videorag = VideoRAG(
+        llm=longervideos_llm_config,
+        working_dir=f"./longervideos/videorag-workdir/{sub_category}",
+        video_caption_fps=5
+    )
     videorag.insert_video(video_path_list=video_paths)
     
     logging.info("--- Video indexing complete. Starting inference stage. ---")

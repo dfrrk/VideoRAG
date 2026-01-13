@@ -6,25 +6,74 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 from moviepy.video.io.VideoFileClip import VideoFileClip
 
-def encode_video(video, frame_times):
-    frames = []
-    for t in frame_times:
-        frames.append(video.get_frame(t))
-    frames = np.stack(frames, axis=0)
-    frames = [Image.fromarray(v.astype('uint8')).resize((1280, 720)) for v in frames]
-    return frames
+import math
+from scipy.spatial import cKDTree
+
+MAX_NUM_FRAMES=180
+MAX_NUM_PACKING=3
+TIME_SCALE = 0.1
+
+def map_to_nearest_scale(values, scale):
+    tree = cKDTree(np.asarray(scale)[:, None])
+    _, indices = tree.query(np.asarray(values)[:, None])
+    return np.asarray(scale)[indices]
+
+
+def group_array(arr, size):
+    return [arr[i:i+size] for i in range(0, len(arr), size)]
+
+def encode_video_for_minicpm(video_path, choose_fps=3, force_packing=None):
+    from decord import VideoReader, cpu
+    def uniform_sample(l, n):
+        gap = len(l) / n
+        idxs = [int(i * gap + gap / 2) for i in range(n)]
+        return [l[i] for i in idxs]
+    vr = VideoReader(video_path, ctx=cpu(0))
+    fps = vr.get_avg_fps()
+    video_duration = len(vr) / fps
+
+    if choose_fps * int(video_duration) <= MAX_NUM_FRAMES:
+        packing_nums = 1
+        choose_frames = round(min(choose_fps, round(fps)) * min(MAX_NUM_FRAMES, video_duration))
+    else:
+        packing_nums = math.ceil(video_duration * choose_fps / MAX_NUM_FRAMES)
+        if packing_nums <= MAX_NUM_PACKING:
+            choose_frames = round(video_duration * choose_fps)
+        else:
+            choose_frames = round(MAX_NUM_FRAMES * MAX_NUM_PACKING)
+            packing_nums = MAX_NUM_PACKING
+
+    frame_idx = [i for i in range(0, len(vr))]
+    frame_idx =  np.array(uniform_sample(frame_idx, choose_frames))
+
+    if force_packing:
+        packing_nums = min(force_packing, MAX_NUM_PACKING)
+
+    frames_numpy = vr.get_batch(frame_idx).asnumpy()
+
+    frame_idx_ts = frame_idx / fps
+    scale = np.arange(0, video_duration, TIME_SCALE)
+
+    frame_ts_id = map_to_nearest_scale(frame_idx_ts, scale) / TIME_SCALE
+    frame_ts_id = frame_ts_id.astype(np.int32)
+
+    assert len(frames_numpy) == len(frame_ts_id)
+
+    frames = [Image.fromarray(v.astype('uint8')).convert('RGB') for v in frames_numpy]
+    frame_ts_id_group = group_array(frame_ts_id, packing_nums)
+
+    return frames, frame_ts_id_group
     
 import asyncio
 from functools import partial
 
 def segment_caption(video_name, video_path, segment_index2name, transcripts, segment_times_info, caption_result, error_queue, global_config=None):
     try:
-        # The caption model is now configured via LLMConfig in the main script
         llm_config = global_config.get("llm", {})
         
-        # Fallback to default if not provided, but the goal is to configure this from outside
         caption_model_func = llm_config.get("caption_model_func_raw", None)
         caption_model_name = llm_config.get("caption_model_name", "minicpm-v")
+        video_caption_fps = global_config.get("video_caption_fps", 3)
 
         if caption_model_func is None:
             raise ValueError("Caption model function not provided in LLMConfig.")
@@ -32,27 +81,35 @@ def segment_caption(video_name, video_path, segment_index2name, transcripts, seg
         caption_func = partial(caption_model_func, caption_model_name, global_config=global_config)
 
         async def run_captioning():
-            with VideoFileClip(video_path) as video:
-                for index in tqdm(segment_index2name, desc=f"Captioning Video {video_name}"):
-                    frame_times = segment_times_info[index]["frame_times"]
-                    video_frames = encode_video(video, frame_times)
-                    segment_transcript = transcripts[index]
+            for index in tqdm(segment_index2name, desc=f"Captioning Video {video_name}"):
 
-                    # Prepare content for minicpm_v_caption_complete
-                    content_list = []
-                    for frame in video_frames:
-                        content_list.append({"type": "image_url", "image_url": {"url": frame}}) # This assumes the function can handle PIL images; might need adjustment
-                    content_list.append({"type": "text", "text": f"The transcript of the current video:\n{segment_transcript}.\nNow provide a description (caption) of the video in Chinese."})
+                # Each segment is processed individually
+                segment_info = segment_times_info[index]
+                start_time = segment_info["start"]
+                end_time = segment_info["end"]
 
-                    # Call the async caption function
-                    caption = await caption_func(content_list=content_list)
-                    caption_result[index] = caption.replace("\n", "").replace("<|endoftext|>", "")
+                with VideoFileClip(video_path).subclip(start_time, end_time) as video_segment:
+                    segment_video_path = f"/tmp/{video_name}_segment_{index}.mp4"
+                    video_segment.write_videofile(segment_video_path, codec="libx264", audio_codec="aac", logger=None)
+
+                    video_frames, temporal_ids = encode_video_for_minicpm(segment_video_path, choose_fps=video_caption_fps)
+
+                    os.remove(segment_video_path)
+
+                segment_transcript = transcripts[index]
+
+                content_list = []
+                for frame in video_frames:
+                    content_list.append({"type": "image_url", "image_url": {"url": frame}})
+                content_list.append({"type": "text", "text": f"The transcript of the current video:\n{segment_transcript}.\nNow provide a description (caption) of the video in Chinese."})
+
+                caption = await caption_func(content_list=content_list, temporal_ids=temporal_ids)
+                caption_result[index] = caption.replace("\n", "").replace("<|endoftext|>", "")
 
         asyncio.run(run_captioning())
 
     except Exception as e:
-        error_queue.put(f"Error in segment_caption:\n {str(e)}")
-        # raise RuntimeError # Commented out to avoid stopping the whole process on a single error
+        error_queue.put(f"Error in segment_caption: {str(e)}")
 
 def merge_segment_information(segment_index2name, segment_times_info, transcripts, captions):
     inserting_segments = {}

@@ -231,14 +231,39 @@ videorag.insert_video(video_path_list=video_paths)
 
 ### 2. 视频字幕 (Caption) 模型替换
 
-**集成模型**: **MiniCPM-V**
+**集成模型**: **MiniCPM-V (采用高帧率采样)**
 
-*   **优点**: 这是一个强大的开源多模态大模型，能够处理视觉和语言任务。它非常适合为视频片段生成描述性字幕。
-*   **部署**: 您需要根据 MiniCPM-V 的官方文档，在本地部署其推理服务。通常，这会通过 `vLLM` 或类似的框架来完成，最终会在本地暴露一个与 OpenAI API 兼容的 API 端点（例如 `http://localhost:8001/v1`）。
+*   **优点**: MiniCPM-V 不仅是一个性能顶尖的多模态模型，更重要的是，它引入了一种名为 **3D-Resampler** 的先进视频处理技术。这使得模型能够高效地处理高帧率的视频流（例如 5-10 FPS），从而捕捉到稀疏采样会遗漏的连续动作和细节，极大地提升了视频分析的精度。
+*   **部署**: 您需要根据 MiniCPM-V 的官方文档，在本地部署其推理服务。通常，这会通过 `vLLM` 框架来完成，最终会在本地暴露一个与 OpenAI API 兼容的 API 端点（例如 `http://localhost:8001/v1`）。
 
 **修改步骤**:
 
-**a) 修改 `videorag/_llm.py`**
+**a) 采纳官方的高级视频编码逻辑**
+
+第一步，也是最关键的一步，是放弃项目中原有的简单、稀疏的视频采样方法，转而采用 MiniCPM-V 官方提供的 `encode_video` 逻辑。
+
+在 `videorag/_videoutil/caption.py` 文件中，我们用以下实现替换了原有的 `encode_video` 函数：
+
+```python
+# caption.py
+import math
+import numpy as np
+from PIL import Image
+from moviepy.video.io.VideoFileClip import VideoFileClip
+from scipy.spatial import cKDTree
+from decord import VideoReader, cpu
+
+# ... (Constants: MAX_NUM_FRAMES, MAX_NUM_PACKING, TIME_SCALE)
+
+def encode_video_for_minicpm(video_path, choose_fps=3, force_packing=None):
+    # ... (Implementation from MiniCPM-V repository)
+    # This function takes a video path and a target FPS,
+    # samples frames at that rate, and crucially, generates
+    # temporal_ids for the 3D-Resampler.
+    # It returns (list_of_pil_images, temporal_ids)
+```
+
+**b) 修改 `videorag/_llm.py`**
 
 我们需要在此文件中添加一个新函数，用于与本地部署的 MiniCPM-V 模型进行交互。我们还需要确保 `LLMConfig` 数据类可以保存字幕模型的信息。
 
@@ -401,9 +426,25 @@ def segment_caption(video_name, video_path, segment_index2name, transcripts, seg
 # ...
 ```
 
-**d) 修改 `videorag_longervideos.py`**
+**d) 修改 `videorag/videorag.py`**
 
-最后，在主脚本中，更新 `longervideos_llm_config` 对象，以使用我们新创建的函数和模型。
+我们需要在 `VideoRAG` 类中添加一个新的配置参数 `video_caption_fps`，以便在主脚本中进行配置。
+
+```python
+# videorag.py
+
+@dataclass
+class VideoRAG:
+    # ...
+    fine_num_frames_per_segment: int = 15 # frames
+    video_caption_fps: int = 3 # New parameter
+    video_output_format: str = "mp4"
+    # ...
+```
+
+**e) 修改 `videorag_longervideos.py`**
+
+最后，在主脚本中，我们不仅要配置模型，还要设置我们想要的视频采样帧率。
 
 ```python
 # videorag_longervideos.py
@@ -415,14 +456,20 @@ from videorag._llm import * # 确保新函数被导入
 longervideos_llm_config = LLMConfig(
     # ... (保留 embedding 和其他模型的配置)
 
-    # ↓↓↓ 添加以下部分 ↓↓↓
     # Caption model configuration
     caption_model_func_raw=minicpm_v_caption_complete,
-    caption_model_name="minicpm-v" # 或您本地服务器特定的模型标识符
+    caption_model_name="minicpm-v"
 )
 
 if __name__ == '__main__':
+    # ...
+    videorag = VideoRAG(
+        llm=longervideos_llm_config,
+        working_dir=f"./longervideos/videorag-workdir/{sub_category}",
+        video_caption_fps=5  # Set desired FPS here
+    )
+    videorag.insert_video(video_path_list=video_paths)
     # ... (后续代码不变)
 ```
 
-通过以上修改，`VideoRAG` 实例在进行视频字幕生成时，将调用 `minicpm_v_caption_complete` 函数，该函数会将请求发送到您本地部署的 MiniCPM-V 模型服务，从而实现了完全本地化的、高质量的中文视频内容分析。
+通过以上修改，`VideoRAG` 实例在进行视频字幕生成时，将首先以 **5 FPS** 的高帧率对每个视频片段进行采样，然后将这些帧序列和它们的时间戳ID (`temporal_ids`) 一同发送到您本地部署的 MiniCPM-V 模型服务。这激活了模型的 3D-Resampler，从而实现了对视频内容更深入、更精确的分析。

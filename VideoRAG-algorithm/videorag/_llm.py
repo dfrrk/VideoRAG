@@ -192,6 +192,7 @@ async def minicpm_v_caption_complete(
     Calls a local, OpenAI-compatible API endpoint for MiniCPM-V model completion.
     """
     global_config = kwargs.get("global_config", {})
+    temporal_ids = kwargs.get("temporal_ids")
 
     local_api_base = global_config.get("local_vlm_base_url", "http://localhost:8001/v1")
 
@@ -226,6 +227,7 @@ async def minicpm_v_caption_complete(
         response = await local_client.chat.completions.create(
             model=model_name,
             messages=messages,
+            extra_body={"temporal_ids": temporal_ids, "use_image_id": False, "max_slice_nums": 1}
         )
         return response.choices[0].message.content
     except Exception as e:

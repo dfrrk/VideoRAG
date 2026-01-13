@@ -67,6 +67,7 @@ class VideoRAG:
     video_segment_length: int = 30 # seconds
     rough_num_frames_per_segment: int = 15 # frames
     fine_num_frames_per_segment: int = 15 # frames
+    video_caption_fps: int = 3
     video_output_format: str = "mp4"
     audio_output_format: str = "mp3"
     video_embedding_batch_num: int = 2
