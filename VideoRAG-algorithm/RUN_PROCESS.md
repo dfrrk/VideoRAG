@@ -231,102 +231,198 @@ videorag.insert_video(video_path_list=video_paths)
 
 ### 2. 视频字幕 (Caption) 模型替换
 
-**推荐模型**: **Qwen-VL-Max (通义千问VL-Max)**
+**集成模型**: **MiniCPM-V**
 
-*   **优点**: 这是目前最强大的开源多模态大模型之一，由阿里巴巴开发。它在图像和视频理解、视觉问答等方面都达到了顶尖水平，非常适合生成高质量、详细的视频描述。它对中文的理解和生成能力尤其出色。
-*   **部署**: 与 FunASR 类似，您需要根据 [Qwen-VL 的官方文档](https://github.com/QwenLM/Qwen-VL) 在本地部署其推理服务。通常，这会通过类似 `vLLM` 或 `FastChat` 的框架来完成，最终也会在本地暴露一个与 OpenAI API 兼容的 API 端点（例如 `http://localhost:8001/v1/chat/completions`）。
+*   **优点**: 这是一个强大的开源多模态大模型，能够处理视觉和语言任务。它非常适合为视频片段生成描述性字幕。
+*   **部署**: 您需要根据 MiniCPM-V 的官方文档，在本地部署其推理服务。通常，这会通过 `vLLM` 或类似的框架来完成，最终会在本地暴露一个与 OpenAI API 兼容的 API 端点（例如 `http://localhost:8001/v1`）。
 
 **修改步骤**:
 
 **a) 修改 `videorag/_llm.py`**
 
-我们需要在这个文件中添加一个新的 `..._complete` 函数，用于与本地部署的 Qwen-VL 模型进行交互。
+我们需要在此文件中添加一个新函数，用于与本地部署的 MiniCPM-V 模型进行交互。我们还需要确保 `LLMConfig` 数据类可以保存字幕模型的信息。
 
 **示例 - 添加一个新的本地 Caption 函数**:
 
-在 `_llm.py` 文件中，您可以添加如下函数：
+在 `_llm.py` 文件中，添加以下函数。此函数将连接到本地模型服务器，发送视频帧和文本提示，并返回生成的字幕。
 
 ```python
 # _llm.py
 
+import base64
+from io import BytesIO
+from PIL import Image
+from openai import AsyncOpenAI
+from logging import getLogger
+
+logger = getLogger(__name__)
+
 # ... (保留文件中的其他 import 和函数)
 
-# 新增函数，用于调用本地部署的、与 OpenAI API 兼容的模型
-async def local_openai_compatible_caption_complete(
+async def minicpm_v_caption_complete(
     model_name: str, content_list: list, **kwargs
 ) -> str:
     """
-    Calls a local, OpenAI-compatible API endpoint for vision model completion.
+    调用本地的、与 OpenAI API 兼容的 MiniCPM-V 模型端点。
     """
     global_config = kwargs.get("global_config", {})
 
-    # 从全局配置中获取本地模型的 API 地址，或者直接硬编码
-    # 建议在 videorag.py 的 __post_init__ 中增加一个 local_vlm_base_url 成员
     local_api_base = global_config.get("local_vlm_base_url", "http://localhost:8001/v1")
 
-    # 创建一个指向本地服务的 AsyncOpenAI 客户端
     local_client = AsyncOpenAI(
-        api_key="your-dummy-api-key",  # 本地服务通常不需要真实的 API Key
+        api_key="your-dummy-api-key",
         base_url=local_api_base,
     )
 
+    processed_content = []
+    for item in content_list:
+        if item["type"] == "image_url":
+            pil_image = item["image_url"]["url"]
+            if isinstance(pil_image, Image.Image):
+                buffered = BytesIO()
+                pil_image.save(buffered, format="PNG")
+                img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                processed_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{img_str}"}
+                })
+            else:
+                 processed_content.append(item)
+        else:
+            processed_content.append(item)
+
     messages = [
         {"role": "system", "content": "You are a helpful assistant that describes video content in Chinese."},
-        {"role": "user", "content": content_list}
+        {"role": "user", "content": processed_content}
     ]
 
     try:
         response = await local_client.chat.completions.create(
-            model=model_name,  # 这里的 model_name 需要与您在本地服务中加载的模型名称一致
+            model=model_name,
             messages=messages,
         )
         return response.choices[0].message.content
     except Exception as e:
-        logger.error(f"Local VLM request failed: {e}")
-        return "" # 返回空字符串表示失败
+        logger.error(f"Local MiniCPM-V request failed: {e}")
+        return ""
 
 ```
 
-**b) 修改 `videorag_longervideos.py`**
+接下来，更新 `LLMConfig` 数据类以包含字幕模型配置：
 
-现在，在主脚本中，您需要更新 `longervideos_llm_config` 对象，使其使用我们新创建的函数和新模型。
+```python
+# _llm.py
+
+@dataclass
+class LLMConfig:
+    # ... (保留所有现有字段)
+
+    cheap_model_max_token_size: int
+    cheap_model_max_async: int
+
+    caption_model_func_raw: callable = None
+    caption_model_name: str = None
+
+    # Assigned in post init
+    embedding_func: EmbeddingFunc  = None
+    best_model_func: callable = None
+    cheap_model_func: callable = None
+```
+
+**b) 修改 `videorag/_videoutil/caption.py`**
+
+现在，我们需要更新 `segment_caption` 函数，使其不再硬编码模型，而是使用我们通过 `LLMConfig` 传入的函数。
+
+```python
+# caption.py
+
+import asyncio
+from functools import partial
+from moviepy.video.io.VideoFileClip import VideoFileClip
+from tqdm import tqdm
+
+# ... (保留 encode_video 函数)
+
+def segment_caption(video_name, video_path, segment_index2name, transcripts, segment_times_info, caption_result, error_queue, global_config=None):
+    try:
+        llm_config = global_config.get("llm", {})
+
+        caption_model_func = llm_config.get("caption_model_func_raw")
+        caption_model_name = llm_config.get("caption_model_name", "minicpm-v")
+
+        if caption_model_func is None:
+            raise ValueError("Caption model function not provided in LLMConfig.")
+
+        caption_func = partial(caption_model_func, caption_model_name, global_config=global_config)
+
+        async def run_captioning():
+            with VideoFileClip(video_path) as video:
+                for index in tqdm(segment_index2name, desc=f"Captioning Video {video_name}"):
+                    frame_times = segment_times_info[index]["frame_times"]
+                    video_frames = encode_video(video, frame_times)
+                    segment_transcript = transcripts[index]
+
+                    content_list = []
+                    for frame in video_frames:
+                        content_list.append({"type": "image_url", "image_url": {"url": frame}})
+                    content_list.append({"type": "text", "text": f"The transcript of the current video:\n{segment_transcript}.\nNow provide a description (caption) of the video in Chinese."})
+
+                    caption = await caption_func(content_list=content_list)
+                    caption_result[index] = caption.replace("\n", "").replace("<|endoftext|>", "")
+
+        asyncio.run(run_captioning())
+
+    except Exception as e:
+        error_queue.put(f"Error in segment_caption:\n {str(e)}")
+
+```
+
+**c) 修改 `videorag/videorag.py`**
+
+我们需要更新 `insert_video` 方法，以将全局配置传递给 `segment_caption` 进程。
+
+```python
+# videorag.py
+
+# ... (在 insert_video 方法中)
+            process_segment_caption = multiprocessing.Process(
+                target=segment_caption,
+                args=(
+                    video_name,
+                    video_path,
+                    segment_index2name,
+                    transcripts,
+                    segment_times_info,
+                    captions,
+                    error_queue,
+                    asdict(self), # 传入全局配置
+                )
+            )
+# ...
+```
+
+**d) 修改 `videorag_longervideos.py`**
+
+最后，在主脚本中，更新 `longervideos_llm_config` 对象，以使用我们新创建的函数和模型。
 
 ```python
 # videorag_longervideos.py
 
-# ... (其他 import)
-from videorag._llm import * # 确保新的函数被导入
+from videorag._llm import * # 确保新函数被导入
 
 # ...
 
 longervideos_llm_config = LLMConfig(
     # ... (保留 embedding 和其他模型的配置)
 
-    # ↓↓↓ 修改以下部分 ↓↓↓
-    # Caption model
-    caption_model_func_raw = local_openai_compatible_caption_complete, # 指向我们新创建的函数
-    caption_model_name = "qwen-vl-max", # 替换为您在本地部署的模型名称
-    caption_model_max_async = 3
+    # ↓↓↓ 添加以下部分 ↓↓↓
+    # Caption model configuration
+    caption_model_func_raw=minicpm_v_caption_complete,
+    caption_model_name="minicpm-v" # 或您本地服务器特定的模型标识符
 )
 
 if __name__ == '__main__':
     # ... (后续代码不变)
 ```
 
-通过以上修改，`VideoRAG` 实例在进行视频字幕生成时，就会调用 `local_openai_compatible_caption_complete` 函数，该函数会将请求发送到您本地部署的 `Qwen-VL-Max` 模型服务，从而实现了完全本地化的、高质量的中文视频内容分析。
-
-**c) (可选) 传递本地 API 地址**
-
-为了让代码更灵活，您可以不在 `_llm.py` 中硬编码 `local_api_base`。您可以在 `videorag.py` 的 `VideoRAG` 类中增加一个 `local_vlm_base_url` 成员，并在 `videorag_longervideos.py` 中初始化 `VideoRAG` 实例时传入这个地址。这样，您就可以轻松地在不同地址部署您的模型服务了。
-
-```python
-# videorag_longervideos.py 中
-videorag = VideoRAG(
-    llm=longervideos_llm_config,
-    working_dir=f"./videorag-workdir/{sub_category}",
-    asr_model="funasr-paraformer-large",
-    local_vlm_base_url="http://localhost:8001/v1" # 在这里传入地址
-)
-```
-
-您需要在 `videorag.py` 的 `VideoRAG` 类中接收这个参数，并将其放入 `self.safe_config` 字典中，这样 `_llm.py` 中的函数就可以通过 `kwargs["global_config"]` 访问到它了。
+通过以上修改，`VideoRAG` 实例在进行视频字幕生成时，将调用 `minicpm_v_caption_complete` 函数，该函数会将请求发送到您本地部署的 MiniCPM-V 模型服务，从而实现了完全本地化的、高质量的中文视频内容分析。

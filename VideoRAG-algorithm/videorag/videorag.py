@@ -65,7 +65,7 @@ class VideoRAG:
     # video
     threads_for_split: int = 10
     video_segment_length: int = 30 # seconds
-    rough_num_frames_per_segment: int = 5 # frames
+    rough_num_frames_per_segment: int = 15 # frames
     fine_num_frames_per_segment: int = 15 # frames
     video_output_format: str = "mp4"
     audio_output_format: str = "mp3"
@@ -256,6 +256,7 @@ class VideoRAG:
                     segment_times_info,
                     captions,
                     error_queue,
+                    asdict(self), # Pass the global config
                 )
             )
             

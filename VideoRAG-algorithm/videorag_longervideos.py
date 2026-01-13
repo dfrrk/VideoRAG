@@ -10,9 +10,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 import argparse
+
+# Define the parser and arguments first
 parser = argparse.ArgumentParser(description="Set sub-category and CUDA device.")
 parser.add_argument('--collection', type=str, default='4-rag-lecture')
 parser.add_argument('--cuda', type=str, default='0')
+parser.add_argument('--dry_run', action='store_true', help='Run in dry run mode to test script execution without processing data.')
+
+# Parse the arguments
 args = parser.parse_args()
 sub_category = args.collection
 
@@ -40,10 +45,25 @@ longervideos_llm_config = LLMConfig(
     cheap_model_func_raw = gpt_4o_mini_complete,
     cheap_model_name = "gpt-4o-mini",
     cheap_model_max_token_size = 32768,
-    cheap_model_max_async = 16
+    cheap_model_max_async = 16,
+
+    # Caption model configuration
+    caption_model_func_raw=minicpm_v_caption_complete,
+    caption_model_name="minicpm-v" # Or the specific model identifier for your local server
 )
 
 if __name__ == '__main__':
+    if args.dry_run:
+        print("Executing in dry_run mode. Verifying imports and configurations...")
+        try:
+            videorag = VideoRAG(llm=longervideos_llm_config, working_dir=f"./longervideos/videorag-workdir/{sub_category}")
+            print("VideoRAG instance created successfully.")
+            print("Dry run successful. The script is configured correctly.")
+            sys.exit(0)
+        except Exception as e:
+            print(f"Dry run failed: {e}")
+            sys.exit(1)
+
     multiprocessing.set_start_method('spawn')
     
     ## learn

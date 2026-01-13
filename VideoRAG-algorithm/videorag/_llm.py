@@ -11,6 +11,9 @@ from tenacity import (
     retry_if_exception_type,
 )
 import os
+from logging import getLogger
+
+logger = getLogger(__name__)
 
 from ._utils import compute_args_hash, wrap_embedding_func_with_attrs
 from .base import BaseKVStorage
@@ -61,6 +64,9 @@ class LLMConfig:
     cheap_model_name: str
     cheap_model_max_token_size: int
     cheap_model_max_async: int
+
+    caption_model_func_raw: callable = None
+    caption_model_name: str = None
 
     # Assigned in post init
     embedding_func: EmbeddingFunc  = None    
@@ -174,6 +180,57 @@ openai_config = LLMConfig(
     cheap_model_max_token_size = 32768,
     cheap_model_max_async = 16
 )
+
+import base64
+from io import BytesIO
+from PIL import Image
+
+async def minicpm_v_caption_complete(
+    model_name: str, content_list: list, **kwargs
+) -> str:
+    """
+    Calls a local, OpenAI-compatible API endpoint for MiniCPM-V model completion.
+    """
+    global_config = kwargs.get("global_config", {})
+
+    local_api_base = global_config.get("local_vlm_base_url", "http://localhost:8001/v1")
+
+    local_client = AsyncOpenAI(
+        api_key="your-dummy-api-key",
+        base_url=local_api_base,
+    )
+
+    processed_content = []
+    for item in content_list:
+        if item["type"] == "image_url":
+            pil_image = item["image_url"]["url"]
+            if isinstance(pil_image, Image.Image):
+                buffered = BytesIO()
+                pil_image.save(buffered, format="PNG")
+                img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                processed_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{img_str}"}
+                })
+            else:
+                 processed_content.append(item)
+        else:
+            processed_content.append(item)
+
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant that describes video content in Chinese."},
+        {"role": "user", "content": processed_content}
+    ]
+
+    try:
+        response = await local_client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"Local MiniCPM-V request failed: {e}")
+        return ""
 
 openai_4o_mini_config = LLMConfig(
     embedding_func_raw = openai_embedding,
